@@ -1,0 +1,58 @@
+rfplayer:
+    waittosend: 500
+    port: /dev/ttyUSB0
+    timeout: 100
+    minread: 4
+    rtsctsflowcontrol: true
+    initialisation:
+        -
+            cmd: 'ZIA++REPEATER OFF'
+        -
+            cmd: 'ZIA++RFLINK 0'
+        -
+            cmd: 'ZIA++LEDACTIVITY 1'
+        -
+            cmd: 'ZIA++FREQ L 433920'
+        -
+            cmd: 'ZIA++SELECTIVITY L 0'
+        -
+            cmd: 'ZIA++DSPTRIGGER L 8'
+        -
+            cmd: 'ZIA++FREQ H 868950'
+        -
+            cmd: 'ZIA++SELECTIVITY H 0'
+        -
+            cmd: 'ZIA++DSPTRIGGER H 6'
+        -
+            cmd: 'ZIA++LBT 16'
+        -
+            cmd: 'ZIA++FORMAT RFLINK OFF'
+        -
+            cmd: 'ZIA++FORMAT BINARY'
+        -
+            cmd: 'ZIA++TRACE - *'
+        -
+            cmd: 'ZIA++JAMMING 7'
+brockermqtt:
+    username: username
+    password: password
+    protocol: tls
+    address: mqtt.perso.ovh
+    port: 8883
+    certfile: /path/to/ca.crt
+log:
+    format: ascii
+    output: stdout
+    level: debug
+sensors:
+    -
+        id: 2-1103140112
+        name: INCONNU1
+actuators:
+    -
+        id: d2
+        name: pfsalon
+        protocol: rts
+        topic: home/action/
+        command: Up/My/Down
+
