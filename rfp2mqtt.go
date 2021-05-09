@@ -1,28 +1,36 @@
 /*
- * Gateway package RFPlayer (RFP1000) to MQTT
- *
  * File: /home/jean-yves/go/src/rfp2mqtt/rfp2mqtt.go
  * Project: /home/jean-yves/go/src/rfp2mqtt
- * Created Date: Friday 12 April 2019
+ * Created Date: Monday 23 March 2020
  * Author: Jean-Yves Vern
  * -----
- * Last Modified: Friday 14 February 2020 23:48:21
+ * Last Modified: Friday 28 August 2020 17:02:16
  * Modified By: the developer formerly known as Jean-Yves Vern at <jy.vern@laposte.net>
  * -----
  * Copyright (c) 2020 Company undefined
  * -----
  * HISTORY:
- * 2020-01-03	JYV	Configure and add current header
- * 2020-01-03	JYV	Add TLS support to connect to broker (https://opium.io/blog/mqtt-in-go/)
  */
 
 package main
 
 /**
+ * Gateway package RFPlayer (RFP1000) to MQTT
+ * Author : Jean-Yves Vern
+ * Date : 28 mars 2019
+ *
  * // ? Handle name and directory of configuration file in command line
  *
  * // ! Start daemon mode if set in config : https://github.com/VividCortex/godaemon
  * // ! Handle SIGTERM signal and CTRL/C : https://medium.com/@edwardpie/handling-os-signals-guarantees-graceful-degradation-in-go-cb57d604d39d
+ * // ! Read certificate file from filesystem
+ *
+ * Update : 31 décembre 2019
+ * 	- Ajout du support de connexion en TLS au broker (https://opium.io/blog/mqtt-in-go/)
+ *
+ * Update : 9 mai 2021
+ *  - Ajout du support de commande x2d
+ *  - Ajout de la donnée subtype dans le message json
  */
 
 import (
@@ -166,6 +174,7 @@ const infosType15 = 15
 // Sensor : Struct for sensors
 type Sensor struct {
 	Ref      string
+	SubType  string
 	Name     string
 	Protocol string
 	Topic    string
@@ -338,16 +347,19 @@ type incomingRFInfosType15 struct { // Used by JAMMING (idem Type1)
 }
 
 var cmqtt mqtt.Client
+var cmqttOpts mqtt.ClientOptions
+
 var b bytes.Buffer
 var ch chan []byte
 
-var insecure *bool
+// var insecure *bool
 
 var rfpConfig rfp.OpenOptions
 var rfpPort io.ReadWriteCloser
 
 var errGlobal error
-var sensorsCache *cache.Cache           // Indexed by Id
+var sensorsNameCache *cache.Cache       // Indexed by Id
+var sensorsTopicCache *cache.Cache      // Indexed by Id
 var actuatorsIDCache *cache.Cache       // Indexed by Name
 var actuatorsTopicCache *cache.Cache    // Indexed by Name
 var actuatorsCommandCache *cache.Cache  // Indexed by Name
@@ -372,12 +384,14 @@ type Config struct {
 		} `yaml:"initialisation"`
 	} `yaml:"rfplayer"`
 	Brockermqtt struct {
-		Username string `yaml:"username"`
-		Password string `yaml:"password"`
-		Protocol string `yaml:"protocol"`
-		Address  string `yaml:"address"`
-		Port     int    `yaml:"port"`
-		Certfile string `yaml:"certfile"`
+		Username  string `yaml:"username"`
+		Password  string `yaml:"password"`
+		Protocol  string `yaml:"protocol"`
+		Address   string `yaml:"address"`
+		Port      int    `yaml:"port"`
+		Certfile  string `yaml:"certfile"`
+		Insecure  bool   `yaml:"insecure"`
+		TopicRoot string `yaml:"topicroot"`
 	} `yaml:"brockermqtt"`
 	Log struct {
 		Format string `yaml:"format"`
@@ -419,7 +433,8 @@ func touint32(msb uint16, lsb uint16) (u32 uint32) {
 func atobDeviceID(dID string) (u32 uint32) {
 
 	uLettre := dID[0] - 'A'
-	sChiffre := dID[1:len(dID)]
+	// sChiffre := dID[1:len(dID)]
+	sChiffre := dID[1:]
 	uChiffre, err := strconv.ParseUint(sChiffre, 10, 32)
 	if err != nil {
 		return 0
@@ -460,14 +475,22 @@ func decode(l int, m []byte) {
 		log.Debug(", SubType=", binary.LittleEndian.Uint16(m[13:]))
 		log.Debug(", Id=", binary.LittleEndian.Uint32(m[15:]))
 
-		sensor.Ref = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[15:])), 10)
+		sensor.Ref = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
 		sensor.Protocol = "X10"
-		sensor.Topic = "x10/" + sensor.Ref
-
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/x10"
+		}
 		log.Debug(", topic=", sensor.Topic)
 
+		topicSplit := strings.Split(sensor.Topic, "/")
+
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType1:
@@ -477,12 +500,20 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "1-" + strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[15:])), 10)
 		sensor.Protocol = "CHACON"
-		sensor.Topic = "chacon/" + sensor.Ref
-
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/chacon"
+		}
 		log.Debug(", topic=", sensor.Topic)
 
+		topicSplit := strings.Split(sensor.Topic, "/")
+
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType2:
@@ -493,23 +524,27 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "2-" + strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[15:])), 10)
 		sensor.Protocol = "VISONIC"
-
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
 		sensor.Name = sensorName(sensor.Ref)
-
-		sensor.Topic = "visonic/" + sensor.Name
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/visonic"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		qualifierString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[19:])), 10)
 
-		log.Debug(", topic=", sensor.Topic)
+		topicSplit := strings.Split(sensor.Topic, "/")
 
 		jsonString = "{ \"tc\": \"" + timecodeString
-		jsonString = jsonString + "\" , \"n\": \"" + sensor.Name
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"q\": \"" + qualifierString
 		jsonString = jsonString + "\" , \"ftamper\": \"" + testBit(m[19], 0)  // tamper flag
 		jsonString = jsonString + "\" , \"falarm\": \"" + testBit(m[19], 1)   // alarm flag
 		jsonString = jsonString + "\" , \"flowbatt\": \"" + testBit(m[19], 2) // low batt flag
 		jsonString = jsonString + "\" , \"falive\": \"" + testBit(m[19], 3)   // supervisor message flag
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType3:
@@ -520,19 +555,23 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "3-" + strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[15:])), 10)
 		sensor.Protocol = "RTS"
-
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
 		sensor.Name = sensorName(sensor.Ref)
-
-		sensor.Topic = "rts/" + sensor.Name
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/rts"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		qualifierString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[19:])), 10)
 
-		log.Debug(", topic=", sensor.Topic)
+		topicSplit := strings.Split(sensor.Topic, "/")
 
 		jsonString = "{ \"tc\": \"" + timecodeString
-		jsonString = jsonString + "\" , \"n\": \"" + sensor.Name
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"q\": \"" + qualifierString
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType4:
@@ -546,23 +585,31 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "4-" + strconv.FormatUint(uint64(touint32(binary.LittleEndian.Uint16(m[15:]), binary.LittleEndian.Uint16(m[17:]))), 10)
 		sensor.Protocol = "OREGON"
-
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
 		sensor.Name = sensorName(sensor.Ref)
-
-		sensor.Topic = "oregon-th/" + sensor.Name
-
-		tempString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[21:])), 10)
-		humiString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[23:])), 10)
-
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/th"
+		}
 		log.Debug(", topic=", sensor.Topic)
 
+		tempString := strconv.FormatFloat(float64(uint64(binary.LittleEndian.Uint16(m[21:])))*0.1, 'f', 1, 64)
+		humiString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[23:])), 10)
+
+		topicSplit := strings.Split(sensor.Topic, "/")
+
 		jsonString = "{ \"tc\": \"" + timecodeString
-		jsonString = jsonString + "\" , \"n\": \"" + sensor.Name
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"t\": \"" + tempString
 		jsonString = jsonString + "\" , \"h\": \"" + humiString
 		jsonString = jsonString + "\" , \"flowbatt\": \"" + testBit(m[19], 0) // low batt flag
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
+		//		} else {
+		//			log.Info("RFLevel=", int8(m[8]), ", FloorNoise=", int8(m[9]), ", RFQuality=", m[10], ", Protocol=", m[11], ", InfosType=", m[12])
+		//			log.Info("Topic problem : topic=>", sensor.Topic, "<, len=", len(topicSplit), ", Sensor Ref:>", sensor.Ref, "<")
+		//		}
 
 	case infosType5:
 		log.Debug(", OREGON Atmo pressure")
@@ -576,20 +623,28 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "5-" + strconv.FormatUint(uint64(touint32(binary.LittleEndian.Uint16(m[15:]), binary.LittleEndian.Uint16(m[17:]))), 10)
 		sensor.Protocol = "OREGON"
-		sensor.Topic = "oregon-atmo/" + sensor.Ref
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/thpa"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		tempString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[21:])), 10)
 		humiString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[23:])), 10)
 		pressureString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[25:])), 10)
 
-		log.Debug(", topic=", sensor.Topic)
+		topicSplit := strings.Split(sensor.Topic, "/")
 
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"t\": \"" + tempString
 		jsonString = jsonString + "\" , \"h\": \"" + humiString
 		jsonString = jsonString + "\" , \"p\": \"" + pressureString
 		jsonString = jsonString + "\" , \"flowbatt\": \"" + testBit(m[19], 0) // low batt flag
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType6:
@@ -603,18 +658,26 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "6-" + strconv.FormatUint(uint64(touint32(binary.LittleEndian.Uint16(m[15:]), binary.LittleEndian.Uint16(m[17:]))), 10)
 		sensor.Protocol = "OREGON"
-		sensor.Topic = "oregon-wind/" + sensor.Ref
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/wind"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		speedString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[21:])), 10)
 		directionString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[23:])), 10)
 
-		log.Debug(", topic=", sensor.Topic)
+		topicSplit := strings.Split(sensor.Topic, "/")
 
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"s\": \"" + speedString
 		jsonString = jsonString + "\" , \"d\": \"" + directionString
 		jsonString = jsonString + "\" , \"flowbatt\": \"" + testBit(m[19], 0) // low batt flag
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType7:
@@ -627,16 +690,24 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "7-" + strconv.FormatUint(uint64(touint32(binary.LittleEndian.Uint16(m[15:]), binary.LittleEndian.Uint16(m[17:]))), 10)
 		sensor.Protocol = "OREGON"
-		sensor.Topic = "oregon-uv/" + sensor.Ref
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/uv"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		lightString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[21:])), 10)
 
-		log.Debug(", topic=", sensor.Topic)
+		topicSplit := strings.Split(sensor.Topic, "/")
 
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"l\": \"" + lightString
 		jsonString = jsonString + "\" , \"flowbatt\": \"" + testBit(m[19], 0) // low batt flag
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType8:
@@ -653,7 +724,13 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "8-" + strconv.FormatUint(uint64(touint32(binary.LittleEndian.Uint16(m[15:]), binary.LittleEndian.Uint16(m[17:]))), 10)
 		sensor.Protocol = "OWL"
-		sensor.Topic = "owl/" + sensor.Ref
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/owl"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		energyString := strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[21:])), 10)
 		powerString := strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[25:])), 10)
@@ -661,9 +738,10 @@ func decode(l int, m []byte) {
 		powerI2String := strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[29:])), 10)
 		powerI3String := strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[31:])), 10)
 
-		log.Debug(", topic=", sensor.Topic)
+		topicSplit := strings.Split(sensor.Topic, "/")
 
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"e\": \"" + energyString
 		jsonString = jsonString + "\" , \"p\": \"" + powerString
@@ -671,6 +749,7 @@ func decode(l int, m []byte) {
 		jsonString = jsonString + "\" , \"pi2\": \"" + powerI2String
 		jsonString = jsonString + "\" , \"pi3\": \"" + powerI3String
 		jsonString = jsonString + "\" , \"flowbatt\": \"" + testBit(m[19], 0) // low batt flag
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType9:
@@ -684,18 +763,26 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "9-" + strconv.FormatUint(uint64(touint32(binary.LittleEndian.Uint16(m[15:]), binary.LittleEndian.Uint16(m[17:]))), 10)
 		sensor.Protocol = "OREGON"
-		sensor.Topic = "oregon-rain/" + sensor.Ref
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/rain"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		totalrainString := strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[21:])), 10)
 		rainString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[25:])), 10)
 
-		log.Debug(", topic=", sensor.Topic)
+		topicSplit := strings.Split(sensor.Topic, "/")
 
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"tra\": \"" + totalrainString
 		jsonString = jsonString + "\" , \"ra\": \"" + rainString
 		jsonString = jsonString + "\" , \"flowbatt\": \"" + testBit(m[19], 0) // low batt flag
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType10:
@@ -709,13 +796,20 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "10-" + strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[15:])), 10)
 		sensor.Protocol = "X2D"
-		sensor.Topic = "x2d-th/" + sensor.Ref
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/x2dcontact"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		qualifierString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[19:])), 10)
 
-		log.Debug(", topic=", sensor.Topic)
+		topicSplit := strings.Split(sensor.Topic, "/")
 
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"q\": \"" + qualifierString
 		jsonString = jsonString + "\" , \"ftamper\": \"" + testBit(m[19], 0)    // tamper flag
@@ -723,6 +817,7 @@ func decode(l int, m []byte) {
 		jsonString = jsonString + "\" , \"flowbatt\": \"" + testBit(m[19], 2)   // low batt flag
 		jsonString = jsonString + "\" , \"ftestassoc\": \"" + testBit(m[19], 4) // test assoc flag
 		jsonString = jsonString + "\" , \"fdomestic\": \"" + testBit(m[19], 5)  // domestic frame flag
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType11:
@@ -736,13 +831,22 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "11-" + strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[15:])), 10)
 		sensor.Protocol = "X2D"
-		sensor.Topic = "x2d-shutter/" + sensor.Ref
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/x2dshutter"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		qualifierString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[19:])), 10)
 
 		log.Debug(", topic=", sensor.Topic)
 
+		topicSplit := strings.Split(sensor.Topic, "/")
+
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"q\": \"" + qualifierString
 		jsonString = jsonString + "\" , \"ftamper\": \"" + testBit(m[19], 0)    // tamper flag
@@ -750,6 +854,7 @@ func decode(l int, m []byte) {
 		jsonString = jsonString + "\" , \"flowbatt\": \"" + testBit(m[19], 2)   // low batt flag
 		jsonString = jsonString + "\" , \"ftestassoc\": \"" + testBit(m[19], 4) // test assoc flag
 		jsonString = jsonString + "\" , \"fdomestic\": \"" + testBit(m[19], 5)  // domestic frame flag
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType12:
@@ -762,15 +867,23 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "12-" + strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[15:])), 10)
 		sensor.Protocol = "DEPRECATED"
-		sensor.Topic = "dep/null"
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/null"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		qualifierString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[19:])), 10)
 
-		log.Debug(", topic=", sensor.Topic)
+		topicSplit := strings.Split(sensor.Topic, "/")
 
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"q\": \"" + qualifierString
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType13:
@@ -786,7 +899,13 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "13-" + strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[15:])), 10)
 		sensor.Protocol = "LINKY"
-		sensor.Topic = "linky/" + sensor.Ref
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/linky"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		contracttypeString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[21:])), 10)
 		setpointString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[23:])), 10)
@@ -795,9 +914,10 @@ func decode(l int, m []byte) {
 		apparentpowerString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[33:])), 10)
 		qualifierString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[19:])), 10)
 
-		log.Debug(", topic=", sensor.Topic)
+		topicSplit := strings.Split(sensor.Topic, "/")
 
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"ct\": \"" + contracttypeString
 		jsonString = jsonString + "\" , \"sp\": \"" + setpointString
@@ -805,6 +925,7 @@ func decode(l int, m []byte) {
 		jsonString = jsonString + "\" , \"cnt2\": \"" + cnt2String
 		jsonString = jsonString + "\" , \"ap\": \"" + apparentpowerString
 		jsonString = jsonString + "\" , \"q\": \"" + qualifierString
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType14:
@@ -815,15 +936,23 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "14-" + strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[15:])), 10)
 		sensor.Protocol = "FS20"
-		sensor.Topic = "fs20/" + sensor.Ref
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/fs20"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		qualifierString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[19:])), 10)
 
-		log.Debug(", topic=", sensor.Topic)
+		topicSplit := strings.Split(sensor.Topic, "/")
 
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"q\": \"" + qualifierString
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	case infosType15:
@@ -833,15 +962,23 @@ func decode(l int, m []byte) {
 
 		sensor.Ref = "15-" + strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[15:])), 10)
 		sensor.Protocol = "JAMMING"
-		sensor.Topic = "jamming/" + sensor.Ref
+		sensor.SubType = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(m[13:])), 10)
+		sensor.Name = sensorName(sensor.Ref)
+		sensor.Topic = sensorTopic(sensor.Ref)
+		if sensor.Topic == "NULL" {
+			sensor.Topic = conf.GetString("brokermqtt.topicroot") + "/" + sensor.Ref + "/jamming"
+		}
+		log.Debug(", topic=", sensor.Topic)
 
 		subtypeString := strconv.FormatUint(uint64(binary.LittleEndian.Uint16(m[13:])), 10)
 
-		log.Debug(", topic=", sensor.Topic)
+		topicSplit := strings.Split(sensor.Topic, "/")
 
 		jsonString = "{ \"tc\": \"" + timecodeString
+		jsonString = jsonString + "\" , \"n\": \"" + topicSplit[1]
 		jsonString = jsonString + "\" , \"r\": \"" + sensor.Ref
 		jsonString = jsonString + "\" , \"s\": \"" + subtypeString
+		jsonString = jsonString + "\" , \"st\": \"" + sensor.SubType
 		jsonString = jsonString + "\" }"
 
 	}
@@ -859,8 +996,10 @@ func decode(l int, m []byte) {
 func publish(t string, d string) {
 	var token mqtt.Token
 
-	token = cmqtt.Publish(t, 2, false, d)
-	token.Wait()
+	if cmqtt.IsConnectionOpen() {
+		token = cmqtt.Publish(t, 2, false, d)
+		token.Wait()
+	}
 }
 
 /**
@@ -1040,8 +1179,7 @@ var fMqttMsgHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Mess
 			b.Write([]byte("\x01"))
 		case "visonic868":
 			b.Write([]byte("\x02"))
-		case "chacon":
-		case "dio":
+		case "chacon", "dio":
 			b.Write([]byte("\x03"))
 		case "domia":
 			b.Write([]byte("\x04"))
@@ -1057,8 +1195,7 @@ var fMqttMsgHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Mess
 			b.Write([]byte("\x09"))
 		case "x2dhagas":
 			b.Write([]byte("\x0A"))
-		case "somfyrts":
-		case "rts":
+		case "somfyrts", "rts":
 			b.Write([]byte("\x0B"))
 		case "blyss":
 			b.Write([]byte("\x0C"))
@@ -1072,15 +1209,32 @@ var fMqttMsgHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Mess
 			b.Write([]byte("\x10"))
 		}
 
-		switch string(msg.Payload()) {
-		case "0":
-			b.Write([]byte("\x00")) // Action 0 : OFF / 1 : ON / 2 : DIM / 6 : ASSOC
-		case "1":
-			b.Write([]byte("\x01")) // Action 0 : OFF / 1 : ON / 2 : DIM / 6 : ASSOC
-		case "2":
-			b.Write([]byte("\x02")) // Action 0 : OFF / 1 : ON / 2 : DIM / 6 : ASSOC
-		case "6":
-			b.Write([]byte("\x06")) // Action 0 : OFF / 1 : ON / 2 : DIM / 6 : ASSOC
+		switch actuatorProtocol(topicSplit[2]) {
+		case "visonic433", "visonic868", "chacon", "dio", "domia", "x10", "x2d433", "x2d868", "x2dshutter", "x2dhagas", "somfyrts", "rts", "blyss", "parrot", "fs20", "kd101", "edisio":
+			switch string(msg.Payload()) {
+			case "0": // OFF
+				b.Write([]byte("\x00"))
+			case "1": // ON
+				b.Write([]byte("\x01"))
+			case "2": // DIM
+				b.Write([]byte("\x02"))
+			case "6": // ASSOC
+				b.Write([]byte("\x06"))
+			default:
+				log.Debug(time.Now(), " --- fMqttMsgHandler : Unknown payload : ", string(msg.Payload()))
+			}
+		case "x2dhaelec":
+			log.Debug(time.Now(), " --- fMqttMsgHandler : in X2DHAELEC with payload : ", string(msg.Payload()))
+			switch string(msg.Payload()) {
+			case "AutoLow", "EcoLow", "ConfortLow": // => OFF
+				b.Write([]byte("\x00"))
+			case "Auto", "Eco", "Confort", "Stop", "HorsGel": // => ON
+				b.Write([]byte("\x01"))
+			default:
+				log.Debug(time.Now(), " --- fMqttMsgHandler : Unknown payload : ", string(msg.Payload()))
+			}
+		default:
+			log.Debug(time.Now(), " --- fMqttMsgHandler : unknown protocol ", actuatorProtocol(topicSplit[2]))
 		}
 
 		/**
@@ -1089,16 +1243,39 @@ var fMqttMsgHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Mess
 		h := atobDeviceID(actuatorID(topicSplit[2])) // DeviceID 4 bytes LSB First
 		a := make([]byte, 4)
 		binary.LittleEndian.PutUint32(a, h)
-
 		b.Write(a)
-		if string(msg.Payload()) != "2" {
+
+		switch actuatorProtocol(topicSplit[2]) {
+		case "visonic433", "dio", "chacon":
 			b.Write([]byte("\x00")) // DimValue 0% to 100%
-		} else {
-			b.Write([]byte("\x04")) // DimValue 4% if RTS to emulate My function
+		case "somfyrts", "rts":
+			if string(msg.Payload()) != "2" {
+				b.Write([]byte("\x00")) // DimValue 0% to 100%
+			} else {
+				b.Write([]byte("\x04")) // DimValue 4% if RTS to emulate My function
+			}
+		case "x2dhaelec":
+			switch string(msg.Payload()) {
+			case "Eco", "EcoLow": // => %0
+				b.Write([]byte("\x00")) // Action 0 : OFF / 1 : ON
+			case "Confort", "ConfortLow": // => %3
+				b.Write([]byte("\x03")) // Action 0 : OFF / 1 : ON
+			case "Stop": // => %4
+				b.Write([]byte("\x04")) // Action 0 : OFF / 1 : ON
+			case "HorsGel": // => %5
+				b.Write([]byte("\x05")) // Action 0 : OFF / 1 : ON
+			case "Auto", "AutoLow": // => %7
+				b.Write([]byte("\x07")) // Action 0 : OFF / 1 : ON
+			}
 		}
+
 		b.Write([]byte("\x00")) // Burst 0 by default
 		b.Write([]byte("\x00")) // Qualifier 0 by default
 		b.Write([]byte("\x00")) // Reserved2 0 by default
+
+		if conf.GetString("log.level") == "debug" {
+			dumpByteSlice(b.Bytes())
+		}
 
 		/**
 		 * Send the bytes array to the channel
@@ -1120,7 +1297,8 @@ func loadSensors() {
 	/**
 	 * Build the cache
 	 */
-	sensorsCache = cache.New(cache.NoExpiration, cache.NoExpiration)
+	sensorsNameCache = cache.New(cache.NoExpiration, cache.NoExpiration)
+	sensorsTopicCache = cache.New(cache.NoExpiration, cache.NoExpiration)
 
 	/**
 	 * Load the cache
@@ -1131,13 +1309,36 @@ func loadSensors() {
 		topic := config.Sensors[i].Topic
 		ref := config.Sensors[i].Ref
 		log.Info("Loading sensor data ", i, " Id:", id, " Name:", name, " Topic:", topic, " Ref:", ref)
-		err := sensorsCache.Add(id, name, cache.NoExpiration)
-		if err != nil {
-			log.Info("ERROR while adding sensor, already defined ", id, " !!!")
-		}
-	}
 
-	log.Info("[loadSensors] Number of sensors defined : ", sensorsCache.ItemCount())
+		/**
+		 * Name cache
+		 */
+		err := sensorsNameCache.Add(id, name, cache.NoExpiration)
+		if err != nil {
+			log.Info("ERROR while adding sensor in name cache, already defined ", id, " !!!")
+		}
+
+		/**
+		 * Topic cache
+		 */
+		if topic != "" {
+			err := sensorsTopicCache.Add(id, topic, cache.NoExpiration)
+			if err != nil {
+				log.Info("ERROR while adding sensor in topic cache, already defined ", id, " !!!")
+			}
+		} else {
+			/**
+			 * Si pas de topic défini, on prend le paramètre name
+			 */
+			err := sensorsTopicCache.Add(id, name, cache.NoExpiration)
+			if err != nil {
+				log.Info("ERROR while adding sensor in topic cache, already defined ", id, " !!!")
+			}
+
+		}
+
+		log.Info("[loadSensors] Number of sensors defined : ", sensorsNameCache.ItemCount())
+	}
 }
 
 /**
@@ -1214,11 +1415,28 @@ func loadActuators() {
 func sensorName(sensorID string) string {
 	var r string
 
-	foo, found := sensorsCache.Get(sensorID)
+	foo, found := sensorsNameCache.Get(sensorID)
 	if found {
 		r = foo.(string)
 	} else {
 		r = "NULL"
+	}
+
+	return r
+}
+
+/**
+ * Function that return the sensor topic by its ID if it exists
+ */
+func sensorTopic(sensorID string) string {
+	var r string
+
+	foo, found := sensorsTopicCache.Get(sensorID)
+	if found {
+		r = foo.(string)
+	} else {
+		r = "NULL"
+		log.Info("Fail to find sensorId : >", sensorID, "<")
 	}
 
 	return r
@@ -1259,6 +1477,102 @@ func actuatorProtocol(actuatorName string) string {
 }
 
 /**
+ * Function called when the MQTT connection is UP
+ *
+ */
+func connUpHandler(c mqtt.Client) {
+	log.Info("[MQTT] Connection up...")
+
+	// Subscribe now we are connected
+	if tokenS := cmqtt.Subscribe("home/action/#", 2, fMqttMsgHandler); tokenS.Wait() && tokenS.Error() != nil {
+		log.Info("[MQTT] Subscription failed...")
+		//panic(tokenS.Error())
+	} else {
+		log.Info("[MQTT] Subscribed to home/action/# topic ...")
+	}
+}
+
+/**
+ * Function called when the MQTT connection is lost
+ *
+ */
+func connLostHandler(c mqtt.Client, err error) {
+	log.Info("[MQTT] Connection lost, reason: ", err)
+
+	//Perform additional action...
+}
+
+/**
+ * Function called to setup MQTT client and connect
+ *
+ */
+func mqttSetupAndConnect() {
+	/**
+	 * Setup MQTT
+	 */
+	var broker bytes.Buffer
+	broker.WriteString(conf.GetString("brockermqtt.protocol"))
+	broker.WriteString("://")
+	broker.WriteString(conf.GetString("brockermqtt.address"))
+	broker.WriteString(":")
+	broker.WriteString(conf.GetString("brockermqtt.port"))
+
+	log.Info("[MQTT] connection URL : ", broker.String())
+
+	cmqttOpts := mqtt.NewClientOptions()
+
+	if conf.GetString("brockermqtt.protocol") == "tls" {
+		// TLS connexion
+		insecure := conf.GetBool("brockermqtt.insecure")
+		if insecure {
+			log.Info("[MQTT] Insecure SSL, does not verify certificate...")
+		}
+
+		// Get the SystemCertPool, continue with an empty pool on error
+		rootCAs, _ := x509.SystemCertPool()
+		if rootCAs == nil {
+			log.Info("[MQTT] No rootCAs, get an empty one...")
+			rootCAs = x509.NewCertPool()
+		}
+
+		// Read in the cert file
+		certs, err := ioutil.ReadFile(conf.GetString("brockermqtt.certfile"))
+		if err != nil {
+			log.Fatal("[MQTT] Failed to append ", conf.GetString("brockermqtt.certfile"), " to RootCAs: ", err)
+		}
+
+		// Append our cert to the system pool
+		if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
+			log.Info("[MQTT] No certs appended, using system certs only")
+		}
+
+		// Trust the augmented cert pool in our client
+		tlsConfig := &tls.Config{
+			RootCAs:            rootCAs,
+			InsecureSkipVerify: insecure,
+		}
+
+		cmqttOpts.SetTLSConfig(tlsConfig) //we set the tls configuration
+	}
+
+	cmqttOpts.AddBroker(broker.String())                          // Add broker information
+	cmqttOpts.SetClientID("rfp2mqtt_pubsub")                      // Add client_id
+	cmqttOpts.SetUsername(conf.GetString("brockermqtt.username")) // Add username
+	cmqttOpts.SetPassword(conf.GetString("brockermqtt.password")) // And password
+	cmqttOpts.SetConnectionLostHandler(connLostHandler)           // Add also en handler for handling lost connection
+	cmqttOpts.SetOnConnectHandler(connUpHandler)                  // Add hendler when connection is performed
+	cmqttOpts.AutoReconnect = false
+
+	cmqtt = mqtt.NewClient(cmqttOpts)
+	if tokenC := cmqtt.Connect(); tokenC.Wait() && tokenC.Error() != nil {
+		log.Info("[MQTT] Connection failed...")
+		// panic(tokenC.Error())
+	} else {
+		log.Info("[MQTT] Connected to broker...")
+	}
+}
+
+/**
  * Function called when rfplayer start
  *
  * - Read configuration
@@ -1286,7 +1600,11 @@ func init() {
 	conf.SetDefault("brokermqtt.protocol", "tls")
 	conf.SetDefault("brokermqtt.address", "127.0.0.1")
 	conf.SetDefault("brockermqtt.port", "1883")
+	conf.SetDefault("brockermqtt.username", "username")
+	conf.SetDefault("brockermqtt.password", "password")
 	conf.SetDefault("brockermqtt.certfile", "ca.crt")
+	conf.SetDefault("brockermqtt.insecure", "false")
+	conf.SetDefault("brockermqtt.topicroot", "rfp2mqtt")
 	conf.SetDefault("log.format", "ascii")
 	conf.SetDefault("log.output", "stdout")
 	conf.SetDefault("log.level", "info")
@@ -1295,7 +1613,7 @@ func init() {
 	 * Initialize config parameters passed by command line if present
 	 */
 	flag.StringVar(&flagConfigFile, "c", "UNDEFINED", "Location and name of config file")
-	insecure = flag.Bool("insecure-ssl", false, "Accept/Ignore all server SSL certificates")
+	// insecure = flag.Bool("insecure-ssl", false, "Accept/Ignore all server SSL certificates")
 	flag.Parse()
 	log.Info("[init] config file which will be used : ", flagConfigFile)
 
@@ -1307,9 +1625,10 @@ func init() {
 		conf.SetConfigFile(flagConfigFile) // Configfile location and name
 	} else {
 		// Load config data from file defined by default in code
-		conf.SetConfigName("config")                          // config name without extension
-		conf.AddConfigPath(".")                               // option where to read the config file
-		conf.AddConfigPath("/home/jean-yves/go/src/rfp2mqtt") // option where to read the config file
+		conf.SetConfigName("config") // config name without extension
+		conf.AddConfigPath(".")      // option where to read the config file
+		conf.AddConfigPath("/dist")  // option where to read the config file
+		//conf.AddConfigPath("/home/jean-yves/go/src/rfp2mqtt") // option where to read the config file
 	}
 	err := conf.ReadInConfig() // Read the config file
 	if err != nil {            // Handle errors reading the config file
@@ -1355,6 +1674,34 @@ func init() {
 	}
 
 	log.SetLevel(logLevel)
+}
+
+func dumpByteSlice(b []byte) {
+	var a [16]byte
+	n := (len(b) + 15) &^ 15
+	for i := 0; i < n; i++ {
+		if i%16 == 0 {
+			fmt.Printf("%4d", i)
+		}
+		if i%8 == 0 {
+			fmt.Print(" ")
+		}
+		if i < len(b) {
+			fmt.Printf(" %02X", b[i])
+		} else {
+			fmt.Print("   ")
+		}
+		if i >= len(b) {
+			a[i%16] = ' '
+		} else if b[i] < 32 || b[i] > 126 {
+			a[i%16] = '.'
+		} else {
+			a[i%16] = b[i]
+		}
+		if i%16 == 15 {
+			fmt.Printf("  %s\n", string(a[:]))
+		}
+	}
 }
 
 func main() {
@@ -1429,7 +1776,7 @@ func main() {
 	}
 
 	/**
-	 * Create the channel for incoming messages MQTT messages to be sent to RFP
+	 * Create the channel for incoming messages
 	 */
 	ch = make(chan []byte, 100)
 
@@ -1441,73 +1788,19 @@ func main() {
 	/**
 	 * Setup MQTT
 	 */
-	var broker bytes.Buffer
-	broker.WriteString(conf.GetString("brockermqtt.protocol"))
-	broker.WriteString("://")
-	broker.WriteString(conf.GetString("brockermqtt.address"))
-	broker.WriteString(":")
-	broker.WriteString(conf.GetString("brockermqtt.port"))
-
-	log.Info("MQTT connection URL : ", broker.String())
-
-	opts := mqtt.NewClientOptions()
-
-	if conf.GetString("brockermqtt.protocol") == "tls" {
-		// TLS connexion
-		if *insecure {
-			log.Info("Insecure SSL, does not verify certificate...")
-		}
-
-		// Get the SystemCertPool, continue with an empty pool on error
-		rootCAs, _ := x509.SystemCertPool()
-		if rootCAs == nil {
-			log.Info("No rootCAs, get an empty one...")
-			rootCAs = x509.NewCertPool()
-		}
-
-		// Read in the cert file
-		certs, err := ioutil.ReadFile(conf.GetString("brockermqtt.certfile"))
-		if err != nil {
-			log.Fatal("Failed to append ", conf.GetString("brockermqtt.certfile"), " to RootCAs: ", err)
-		}
-
-		// Append our cert to the system pool
-		if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
-			log.Info("No certs appended, using system certs only")
-		}
-
-		// Trust the augmented cert pool in our client
-		tlsConfig := &tls.Config{
-			InsecureSkipVerify: *insecure,
-			RootCAs:            rootCAs,
-		}
-
-		opts.SetTLSConfig(tlsConfig) //we set the tls configuration
-	}
-
-	opts.AddBroker(broker.String())                          // Add broker information
-	opts.SetClientID("rfp2mqtt_pubsub")                      // Add client_id
-	opts.SetUsername(conf.GetString("brockermqtt.username")) // Add username
-	opts.SetPassword(conf.GetString("brockermqtt.password")) // and password
-
-	cmqtt = mqtt.NewClient(opts)
-	if tokenC := cmqtt.Connect(); tokenC.Wait() && tokenC.Error() != nil {
-		panic(tokenC.Error())
-	} else {
-		log.Info("Connected to broker...")
-	}
-
-	if tokenS := cmqtt.Subscribe("home/action/#", 2, fMqttMsgHandler); tokenS.Wait() && tokenS.Error() != nil {
-		panic(tokenS.Error())
-	} else {
-		log.Info("Subscribed to home/action/# topic ...")
-	}
+	mqttSetupAndConnect()
 
 	/**
 	 * Sending a watchdog message every 10 seconds
+	 * check if connected, if not, try reconnecting
 	 */
 	for {
 		time.Sleep(10 * time.Second)
-		go publish("rfplayer/watchdog", time.Now().Format(time.RFC3339))
+		if cmqtt.IsConnectionOpen() {
+			go publish("rfplayer/watchdog", time.Now().Format(time.RFC3339))
+		} else {
+			// Try reconnecting
+			mqttSetupAndConnect()
+		}
 	}
 }
