@@ -2,7 +2,7 @@
 
 ## Résumé
 
-Passerelle entre le dongle RFPlayer (RFP1000 - https://rfplayer.com/) et un broker MQTT
+Passerelle entre le dongle RFPlayer (RFP1000 - https://myrfplayer.com/) et un broker MQTT
 
 ## Objectif
 
